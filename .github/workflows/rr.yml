@@ -1,0 +1,226 @@
+name: Runner Receiver
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  receiver:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Version marker
+        shell: pwsh
+        run: |
+          Write-Host "=== RECEIVER v10 (schedule 6h, named-tunnel) ==="
+
+      - name: Download cloudflared
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile "$env:RUNNER_TEMP\cloudflared.exe"
+
+      - name: Start listener with named tunnel
+        shell: pwsh
+        env:
+          SHARED_SECRET:   ${{ secrets.SECRET }}
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workDir  = Join-Path $env:RUNNER_TEMP "remote-exec"
+          $appDir   = Join-Path $workDir "app"
+          $stateTmp = Join-Path $workDir "state-tmp"
+
+          Remove-Item $workDir -Recurse -Force -EA SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $workDir, $appDir | Out-Null
+
+          $cfLog = Join-Path $workDir "cf.log"
+          $cfOut = Join-Path $workDir "cf.out"
+
+          Write-Host "Starting named tunnel..."
+          $cf = Start-Process -FilePath "$env:RUNNER_TEMP\cloudflared.exe" `
+              -ArgumentList @("tunnel","--no-autoupdate","run","--token",$env:CF_TUNNEL_TOKEN) `
+              -RedirectStandardError $cfLog -RedirectStandardOutput $cfOut `
+              -PassThru -NoNewWindow
+
+          $ready = $false
+          for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Seconds 1
+              if (Test-Path $cfLog) {
+                  $log = Get-Content $cfLog -Raw -EA SilentlyContinue
+                  if ($log -match 'Registered tunnel connection') { $ready = $true; break }
+              }
+          }
+          if (-not $ready) {
+              Get-Content $cfLog -Raw -EA SilentlyContinue | Write-Host
+              throw "cloudflared did not register tunnel connection"
+          }
+
+          $publicUrl = "https://finwchain.finwchain.com"
+          Write-Host "PUBLIC URL: $publicUrl"
+
+          $listener = [System.Net.HttpListener]::new()
+          $listener.Prefixes.Add("http://127.0.0.1:8080/")
+          $listener.Start()
+
+          $script:runningProc = $null
+          $script:outFile     = Join-Path $workDir "stdout.txt"
+          $script:errFile     = Join-Path $workDir "stderr.txt"
+
+          function Remove-MacJunk {
+            param([string]$Dir)
+            foreach ($p in @("__MACOSX", ".DS_Store", "._*")) {
+                Get-ChildItem $Dir -Recurse -Force -Filter $p -EA SilentlyContinue |
+                    ForEach-Object { Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue }
+            }
+          }
+          function Safe-RemoveDir {
+            param([string]$Dir)
+            if (-not (Test-Path $Dir)) { return }
+            Get-ChildItem $Dir -Recurse -Force -EA SilentlyContinue |
+                ForEach-Object { Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue }
+            Remove-Item $Dir -Recurse -Force -EA SilentlyContinue
+          }
+          function Stop-Running {
+            if ($script:runningProc -and -not $script:runningProc.HasExited) {
+                Write-Host "[stop] killing PID=$($script:runningProc.Id)"
+                try { $script:runningProc.Kill() } catch {}
+                Start-Sleep -Seconds 2
+            }
+            $script:runningProc = $null
+          }
+
+          try {
+              while ($true) {
+                  $ctx = $listener.GetContext()
+                  $req = $ctx.Request
+                  $res = $ctx.Response
+                  $body = ""
+
+                  try {
+                      if ($req.Headers["X-Secret"] -ne $env:SHARED_SECRET) {
+                          $res.StatusCode = 401; $body = "Unauthorized"
+                      }
+                      else {
+                          switch ($req.Url.AbsolutePath) {
+
+                              "/health" { $res.StatusCode = 200; $body = "OK" }
+
+                              "/fetch" {
+                                  Write-Host "[fetch] start"
+                                  $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+                                  $jsonText = $reader.ReadToEnd(); $reader.Close()
+                                  Write-Host "[fetch] body: $jsonText"
+
+                                  $data = $jsonText | ConvertFrom-Json
+                                  $appUrl   = $data.app_url   -replace 'dl=0','dl=1'
+                                  $stateUrl = $data.state_url -replace 'dl=0','dl=1'
+
+                                  Stop-Running
+
+                                  $appZip = Join-Path $workDir "hits.zip"
+                                  Safe-RemoveDir -Dir $appDir
+                                  New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+                                  Write-Host "[fetch] downloading app..."
+                                  Invoke-WebRequest -Uri $appUrl -OutFile $appZip -UseBasicParsing
+                                  Write-Host "[fetch] app saved $((Get-Item $appZip).Length) bytes"
+                                  Expand-Archive -Path $appZip -DestinationPath $appDir -Force
+                                  Remove-MacJunk -Dir $appDir
+                                  $exe = Get-ChildItem $appDir -Recurse -Filter "9hits.exe" -EA SilentlyContinue | Select-Object -First 1
+                                  if ($exe) { Write-Host "[fetch] found exe: $($exe.FullName)" }
+                                  else      { Write-Host "[fetch] WARN: 9hits.exe not found" }
+
+                                  $stateZip = Join-Path $workDir "9hits-app-state.zip"
+                                  $local = "$env:LOCALAPPDATA\9hits-app"
+                                  Safe-RemoveDir -Dir $local
+                                  Safe-RemoveDir -Dir $stateTmp
+                                  New-Item -ItemType Directory -Force -Path $local, $stateTmp | Out-Null
+                                  Write-Host "[fetch] downloading state..."
+                                  Invoke-WebRequest -Uri $stateUrl -OutFile $stateZip -UseBasicParsing
+                                  Write-Host "[fetch] state saved $((Get-Item $stateZip).Length) bytes"
+                                  Expand-Archive -Path $stateZip -DestinationPath $stateTmp -Force
+                                  Remove-MacJunk -Dir $stateTmp
+                                  if (Test-Path "$stateTmp\9hits-app") {
+                                      Copy-Item "$stateTmp\9hits-app\*" $local -Recurse -Force
+                                  } else {
+                                      Copy-Item "$stateTmp\*" $local -Recurse -Force
+                                  }
+                                  Safe-RemoveDir -Dir $stateTmp
+                                  Write-Host "[fetch] state restored to $local"
+
+                                  $res.StatusCode = 200
+                                  $body = "Fetched OK. AppDir=$appDir"
+                              }
+
+                              "/execute" {
+                                  $exeRel = $req.QueryString["exe"]
+                                  if (-not $exeRel) { $exeRel = "9hits.exe" }
+                                  if ($script:runningProc -and -not $script:runningProc.HasExited) {
+                                      $res.StatusCode = 409; $body = "Already running PID=$($script:runningProc.Id)"
+                                  } else {
+                                      $exe = Get-ChildItem $appDir -Recurse -Filter $exeRel -EA SilentlyContinue | Select-Object -First 1
+                                      if (-not $exe) {
+                                          $res.StatusCode = 404; $body = "Not found: $exeRel under $appDir"
+                                      } else {
+                                          $workPath = Split-Path -Parent $exe.FullName
+                                          Remove-Item $script:outFile,$script:errFile -Force -EA SilentlyContinue
+                                          $script:runningProc = Start-Process -FilePath $exe.FullName `
+                                              -WorkingDirectory $workPath `
+                                              -RedirectStandardOutput $script:outFile `
+                                              -RedirectStandardError  $script:errFile `
+                                              -PassThru
+                                          Write-Host "[execute] started PID=$($script:runningProc.Id) cwd=$workPath"
+                                          $res.StatusCode = 200; $body = "Started PID=$($script:runningProc.Id)"
+                                      }
+                                  }
+                              }
+
+                              "/status" {
+                                  if (-not $script:runningProc) {
+                                      $res.StatusCode = 200; $body = "Not started"
+                                  } elseif ($script:runningProc.HasExited) {
+                                      $res.StatusCode = 200; $body = "Exited with code $($script:runningProc.ExitCode)"
+                                  } else {
+                                      $res.StatusCode = 200; $body = "Running PID=$($script:runningProc.Id)"
+                                  }
+                              }
+
+                              "/logs" {
+                                  $stdout = if (Test-Path $script:outFile) { Get-Content $script:outFile -Raw } else { "" }
+                                  $stderr = if (Test-Path $script:errFile) { Get-Content $script:errFile -Raw } else { "" }
+                                  $res.StatusCode = 200
+                                  $body = "--- STDOUT ---`n$stdout`n--- STDERR ---`n$stderr"
+                              }
+
+                              "/stop" { Stop-Running; $res.StatusCode = 200; $body = "Stopped" }
+
+                              default { $res.StatusCode = 404; $body = "Not found" }
+                          }
+                      }
+                  }
+                  catch {
+                      Write-Host "!! EXCEPTION at $($req.Url.AbsolutePath): $($_.Exception.Message)"
+                      Write-Host $_.ScriptStackTrace
+                      $res.StatusCode = 500; $body = "Error: $($_.Exception.Message)"
+                  }
+                  finally {
+                      try {
+                          if ($body) {
+                              $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+                              $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                          }
+                      } catch { Write-Host "!! write failed: $($_.Exception.Message)" }
+                      try { $res.Close() } catch { Write-Host "!! close failed: $($_.Exception.Message)" }
+                  }
+              }
+          }
+          finally {
+              $listener.Stop(); $listener.Close()
+              if ($cf -and -not $cf.HasExited) { $cf.Kill() }
+          }
