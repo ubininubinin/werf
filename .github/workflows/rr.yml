@@ -50,15 +50,23 @@ jobs:
               -PassThru -NoNewWindow
 
           $ready = $false
-          for ($i = 0; $i -lt 60; $i++) {
+          for ($i = 0; $i -lt 120; $i++) {
               Start-Sleep -Seconds 1
-              if (Test-Path $cfLog) {
-                  $log = Get-Content $cfLog -Raw -EA SilentlyContinue
-                  if ($log -match 'Registered tunnel connection') { $ready = $true; break }
+              if ($cf.HasExited) {
+                  Write-Host "!! cloudflared exited early with code $($cf.ExitCode) at iteration $i"
+                  break
               }
+              $log = ""
+              if (Test-Path $cfLog) { $log += (Get-Content $cfLog -Raw -EA SilentlyContinue) }
+              if (Test-Path $cfOut) { $log += (Get-Content $cfOut -Raw -EA SilentlyContinue) }
+              if ($log -match 'Registered tunnel connection') { $ready = $true; break }
           }
           if (-not $ready) {
+              Write-Host "=== cloudflared STDERR ==="
               Get-Content $cfLog -Raw -EA SilentlyContinue | Write-Host
+              Write-Host "=== cloudflared STDOUT ==="
+              Get-Content $cfOut -Raw -EA SilentlyContinue | Write-Host
+              Write-Host "=== process state: HasExited=$($cf.HasExited) ExitCode=$($cf.ExitCode) ==="
               throw "cloudflared did not register tunnel connection"
           }
 
