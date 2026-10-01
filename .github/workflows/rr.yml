@@ -17,7 +17,7 @@ jobs:
       - name: Version marker
         shell: pwsh
         run: |
-          Write-Host "=== RECEIVER v10 (schedule 6h, named-tunnel) ==="
+          Write-Host "=== RECEIVER v11 (schedule 6h, token-file) ==="
 
       - name: Download cloudflared
         shell: pwsh
@@ -44,8 +44,12 @@ jobs:
           $cfOut = Join-Path $workDir "cf.out"
 
           Write-Host "Starting named tunnel..."
+          $tokenFile = Join-Path $workDir "cf.token"
+          [System.IO.File]::WriteAllText($tokenFile, $env:CF_TUNNEL_TOKEN)
+          Write-Host "Token file written, length: $((Get-Item $tokenFile).Length)"
+
           $cf = Start-Process -FilePath "$env:RUNNER_TEMP\cloudflared.exe" `
-              -ArgumentList @("tunnel","--no-autoupdate","run","--token",$env:CF_TUNNEL_TOKEN) `
+              -ArgumentList @("tunnel","run","--token-file",$tokenFile) `
               -RedirectStandardError $cfLog -RedirectStandardOutput $cfOut `
               -PassThru -NoNewWindow
 
